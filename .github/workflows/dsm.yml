@@ -1,0 +1,36 @@
+name: Send DSM Reminder
+
+on:
+  schedule:
+    - cron: "30 20 * * 1,4"
+      timezone: "Asia/Jakarta"
+  workflow_dispatch:
+
+jobs:
+  send-dsm:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install reminder dependencies
+        run: pip install discord.py python-dotenv
+
+      - name: Send DSM reminder
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          REMINDER_CHANNEL_ID: ${{ secrets.REMINDER_CHANNEL_ID }}
+          BOT_TIMEZONE: ${{ vars.BOT_TIMEZONE || 'Asia/Jakarta' }}
+          DAILY_SCRUM_TIME: ${{ vars.DAILY_SCRUM_TIME || '21:00' }}
+          DSM_REMINDER_MINUTES_BEFORE: ${{ vars.DSM_REMINDER_MINUTES_BEFORE || '30' }}
+          KELOMPOK6_ROLE_MENTION: ${{ secrets.KELOMPOK6_ROLE_MENTION }}
+          ASDOS_MENTION: ${{ secrets.ASDOS_MENTION }}
+          COMMAND_PREFIX: ${{ vars.COMMAND_PREFIX || '!' }}
+        run: python send_reminder.py dsm
