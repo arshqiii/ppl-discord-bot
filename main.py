@@ -39,15 +39,15 @@ COMMAND_PREFIX = os.getenv("COMMAND_PREFIX", "!")
 
 DAILY_SCRUM_DAYS = {
     day.strip().lower()
-    for day in os.getenv("DAILY_SCRUM_DAYS", "monday,tuesday,wednesday,thursday,friday").split(",")
+    for day in os.getenv("DAILY_SCRUM_DAYS", "Senin,Kamis").split(",")
     if day.strip()
 }
-DAILY_SCRUM_TIME = os.getenv("DAILY_SCRUM_TIME", "09:00")
+DAILY_SCRUM_TIME = os.getenv("DAILY_SCRUM_TIME", "21:00")
 DSM_REMINDER_MINUTES_BEFORE = int(os.getenv("DSM_REMINDER_MINUTES_BEFORE", "30"))
 
 THREE_P_DAYS = {
     day.strip().lower()
-    for day in os.getenv("THREE_P_DAYS", "friday").split(",")
+    for day in os.getenv("THREE_P_DAYS", "Rabu,Sabtu").split(",")
     if day.strip()
 }
 THREE_P_TIME = os.getenv("THREE_P_TIME", "16:00")
