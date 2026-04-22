@@ -1,3 +1,9 @@
+"""Discord reminder bot for Daily Scrum and Weekly 3P reporting.
+
+This module keeps runtime state in JSON, sends scheduled reminders,
+and provides commands for manual triggering and 3P tracking.
+"""
+
 import json
 import logging
 import os
@@ -12,6 +18,10 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Logging and environment configuration
+# ---------------------------------------------------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,7 +54,7 @@ THREE_P_TIME = os.getenv("THREE_P_TIME", "16:00")
 
 KELOMPOK6_ROLE_MENTION = os.getenv("KELOMPOK6_ROLE_MENTION")
 ASDOS_MENTION = os.getenv("ASDOS_MENTION")
-THREE_P_ROLE_ID = int(os.getenv("THREE_P_ROLE_ID"))
+
 THREE_P_MEMBER_IDS = {
     int(member_id.strip())
     for member_id in os.getenv("THREE_P_MEMBER_IDS", "").split(",")
@@ -61,7 +71,13 @@ WEEKDAYS = [
     "Minggu",
 ]
 
+
+# ---------------------------------------------------------------------------
+# Persistent state helpers
+# ---------------------------------------------------------------------------
+
 def load_state() -> dict[str, Any]:
+    """Load bot state from JSON file and ensure required top-level keys exist."""
     if not STATE_FILE.exists():
         return {
             "last_sent": {},
@@ -86,6 +102,7 @@ def load_state() -> dict[str, Any]:
 
 
 def save_state(state: dict[str, Any]) -> None:
+    """Persist current bot state into bot_state.json."""
     STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
@@ -101,15 +118,23 @@ intents.members = True
 bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
 
 
+# ---------------------------------------------------------------------------
+# Time and event scheduling utilities
+# ---------------------------------------------------------------------------
+
+
 def now_local() -> datetime:
+    """Return current datetime in configured bot timezone."""
     return datetime.now(timezone)
 
 
 def get_today_name(current_time: datetime) -> str:
+    """Map weekday index to localized weekday name."""
     return WEEKDAYS[current_time.weekday()]
 
 
 def should_send(event_name: str, event_days: set[str], event_time: str, current_time: datetime) -> bool:
+    """Check schedule and deduplicate reminder delivery per date."""
     if get_today_name(current_time) not in event_days:
         return False
 
@@ -121,12 +146,14 @@ def should_send(event_name: str, event_days: set[str], event_time: str, current_
 
 
 def get_dsm_reminder_time(meeting_time: str) -> str:
+    """Compute Daily Scrum reminder time based on configured offset minutes."""
     meeting_datetime = datetime.strptime(meeting_time, "%H:%M")
     reminder_datetime = meeting_datetime - timedelta(minutes=DSM_REMINDER_MINUTES_BEFORE)
     return reminder_datetime.strftime("%H:%M")
 
 
 def open_event_window(event_name: str, channel_id: int, current_time: datetime) -> None:
+    """Track message collection window start time for an event."""
     state["event_windows"][event_name] = {
         "start_time": current_time.isoformat(),
         "channel_id": channel_id,
@@ -135,12 +162,19 @@ def open_event_window(event_name: str, channel_id: int, current_time: datetime) 
 
 
 def get_channel_by_id(channel_id: int) -> discord.abc.Messageable | None:
+    """Resolve channel from configured id, returning None if disabled."""
     if channel_id == 0:
         return None
     return bot.get_channel(channel_id)
 
 
+# ---------------------------------------------------------------------------
+# Weekly 3P parsing and membership helpers
+# ---------------------------------------------------------------------------
+
+
 def get_active_three_p_round() -> dict[str, Any] | None:
+    """Return currently active 3P round, or None if closed/not started."""
     round_data = state["three_p_rounds"].get("active")
     if not round_data or round_data.get("completed"):
         return None
@@ -148,6 +182,7 @@ def get_active_three_p_round() -> dict[str, Any] | None:
 
 
 def normalize_three_p_item(line: str) -> str:
+    """Normalize bullet-style item lines into clean plain text."""
     cleaned = line.strip()
     if cleaned.startswith("- "):
         return cleaned[2:].strip()
@@ -157,6 +192,7 @@ def normalize_three_p_item(line: str) -> str:
 
 
 def parse_three_p_header(line: str) -> tuple[str | None, str]:
+    """Parse section header like 'Progress:' and return key with raw value."""
     if ":" not in line:
         return None, ""
 
@@ -168,12 +204,14 @@ def parse_three_p_header(line: str) -> tuple[str | None, str]:
 
 
 def append_three_p_item(parsed: dict[str, list[str]], section: str, raw_value: str) -> None:
+    """Append non-empty item to a section after normalization."""
     normalized_value = normalize_three_p_item(raw_value)
     if normalized_value:
         parsed.setdefault(section, []).append(normalized_value)
 
 
 def parse_three_p_submission(raw_text: str) -> dict[str, list[str]] | None:
+    """Parse free-form 3P text and validate required sections are present."""
     parsed: dict[str, list[str]] = {}
     current_key: str | None = None
 
@@ -182,6 +220,7 @@ def parse_three_p_submission(raw_text: str) -> dict[str, list[str]] | None:
         if not line:
             continue
 
+        # A new section header switches the active target list.
         header_key, header_value = parse_three_p_header(line)
         if header_key:
             current_key = header_key
@@ -189,6 +228,7 @@ def parse_three_p_submission(raw_text: str) -> dict[str, list[str]] | None:
             append_three_p_item(parsed, current_key, header_value)
             continue
 
+        # Non-header lines are treated as items under the latest section.
         if current_key:
             append_three_p_item(parsed, current_key, line)
 
@@ -198,6 +238,7 @@ def parse_three_p_submission(raw_text: str) -> dict[str, list[str]] | None:
 
 
 def get_members_from_role(role: discord.Role | None) -> dict[int, str]:
+    """Build member mapping from role members, excluding bots."""
     if role is None:
         return {}
 
@@ -209,6 +250,7 @@ def get_members_from_role(role: discord.Role | None) -> dict[int, str]:
 
 
 def get_members_from_ids(guild: discord.Guild, member_ids: set[int]) -> dict[int, str]:
+    """Build member mapping from explicit member ids."""
     members: dict[int, str] = {}
     for member_id in member_ids:
         member = guild.get_member(member_id)
@@ -217,8 +259,9 @@ def get_members_from_ids(guild: discord.Guild, member_ids: set[int]) -> dict[int
 
 
 def get_expected_three_p_members(guild: discord.Guild) -> dict[int, str]:
-    if THREE_P_ROLE_ID:
-        members_from_role = get_members_from_role(guild.get_role(THREE_P_ROLE_ID))
+    """Resolve expected 3P participants from role first, then fallback ids."""
+    if KELOMPOK6_ROLE_MENTION:
+        members_from_role = get_members_from_role(guild.get_role(KELOMPOK6_ROLE_MENTION))
         if members_from_role:
             return members_from_role
 
@@ -229,6 +272,7 @@ def get_expected_three_p_members(guild: discord.Guild) -> dict[int, str]:
 
 
 def start_three_p_round(channel_id: int, current_time: datetime, expected_members: dict[int, str]) -> None:
+    """Initialize and persist a new active 3P collection round."""
     state["three_p_rounds"]["active"] = {
         "round_id": current_time.strftime("%Y-%m-%d"),
         "channel_id": channel_id,
@@ -241,7 +285,13 @@ def start_three_p_round(channel_id: int, current_time: datetime, expected_member
     save_state(state)
 
 
+# ---------------------------------------------------------------------------
+# Embed builders
+# ---------------------------------------------------------------------------
+
+
 def build_scrum_embed() -> discord.Embed:
+    """Build Daily Scrum reminder embed."""
     embed = discord.Embed(
         title="🔔 Daily Scrum Reminder",
         description=(
@@ -263,6 +313,7 @@ def build_scrum_embed() -> discord.Embed:
 
 
 def build_three_p_embed() -> discord.Embed:
+    """Build weekly 3P reminder embed and expected submission format."""
     embed = discord.Embed(
         title="📝 Weekly 3P Reminder",
         description="Jangan lupa kirim 3P kalian hari ini.",
@@ -292,6 +343,7 @@ def build_three_p_embed() -> discord.Embed:
 
 
 def build_three_p_status_embed(round_data: dict[str, Any]) -> discord.Embed:
+    """Build current submitted vs pending status for active 3P round."""
     expected_members = round_data.get("expected_members", {})
     submissions = round_data.get("submissions", {})
 
@@ -330,6 +382,7 @@ def build_three_p_summary_embed(
     description: str,
     color: discord.Color,
 ) -> discord.Embed:
+    """Build final 3P summary embed including each member submission."""
     expected_members = round_data.get("expected_members", {})
     submissions = round_data.get("submissions", {})
     pending_names = [
@@ -382,7 +435,13 @@ def build_three_p_summary_embed(
     return embed
 
 
+# ---------------------------------------------------------------------------
+# Text summary formatters
+# ---------------------------------------------------------------------------
+
+
 def format_summary(event_name: str, messages: list[discord.Message]) -> str:
+    """Create compact text summary grouped by message author."""
     grouped_messages: dict[str, list[str]] = defaultdict(list)
 
     for message in messages:
@@ -405,6 +464,7 @@ def format_summary(event_name: str, messages: list[discord.Message]) -> str:
 
 
 def format_three_p_completion(round_data: dict[str, Any]) -> str:
+    """Create plain-text completion summary for all submitted 3P entries."""
     submissions = round_data.get("submissions", {})
     lines = ["3P selesai, berikut ringkasannya:"]
 
@@ -428,6 +488,7 @@ def format_three_p_completion(round_data: dict[str, Any]) -> str:
 
 
 def format_three_p_status(round_data: dict[str, Any]) -> str:
+    """Create plain-text submitted/pending status for active round."""
     expected_members = round_data.get("expected_members", {})
     submissions = round_data.get("submissions", {})
 
@@ -451,6 +512,7 @@ def format_three_p_status(round_data: dict[str, Any]) -> str:
 
 
 def format_three_p_forced_completion(round_data: dict[str, Any]) -> str:
+    """Create plain-text summary when 3P is manually closed."""
     expected_members = round_data.get("expected_members", {})
     submissions = round_data.get("submissions", {})
     pending_names = [
@@ -489,7 +551,9 @@ def format_three_p_forced_completion(round_data: dict[str, Any]) -> str:
 
     return "\n".join(lines)
 
+
 def build_schedule_summary_embed() -> discord.Embed:
+    """Build embed that shows current configured schedule."""
     embed = discord.Embed(
         title="🗓️ Current Schedule",
         description=(
@@ -502,6 +566,7 @@ def build_schedule_summary_embed() -> discord.Embed:
     return embed
 
 async def collect_event_messages(channel: discord.TextChannel, event_name: str) -> list[discord.Message]:
+    """Collect non-bot messages from tracked event window onward."""
     event_window = state["event_windows"].get(event_name)
     if not event_window:
         return []
@@ -516,11 +581,17 @@ async def collect_event_messages(channel: discord.TextChannel, event_name: str) 
 
     return collected
 
+
+# ---------------------------------------------------------------------------
+# Reminder delivery and background loop
+# ---------------------------------------------------------------------------
+
 async def send_event_reminder(
     event_name: str,
     pre_message: str,
     embed: discord.Embed,
 ) -> None:
+    """Send reminder payload, update state, and bootstrap 3P round when needed."""
     if CHANNEL_ID == 0:
         logger.warning("REMINDER_CHANNEL_ID is not configured.")
         return
@@ -537,6 +608,7 @@ async def send_event_reminder(
     state["last_sent"][event_name] = current_time.strftime("%Y-%m-%d")
     open_event_window(event_name, CHANNEL_ID, current_time)
 
+    # Weekly 3P reminder also starts a fresh submission round.
     if event_name == "weekly_3p" and isinstance(channel, discord.TextChannel):
         expected_members = get_expected_three_p_members(channel.guild)
         start_three_p_round(CHANNEL_ID, current_time, expected_members)
@@ -549,7 +621,7 @@ async def send_event_reminder(
         else:
             await channel.send(
                 "3P started, but no expected members are configured yet. "
-                "Set `THREE_P_ROLE_ID` or `THREE_P_MEMBER_IDS` in `.env`."
+                "Set `KELOMPOK6_ROLE_MENTION` or `THREE_P_MEMBER_IDS` in `.env`."
             )
 
     logger.info("Sent %s reminder to channel %s", event_name, CHANNEL_ID)
@@ -557,6 +629,7 @@ async def send_event_reminder(
 
 @bot.event
 async def on_ready() -> None:
+    """Start periodic reminder task once bot is fully connected."""
     logger.info("Logged in as %s", bot.user)
     if not reminder_loop.is_running():
         reminder_loop.start()
@@ -564,6 +637,7 @@ async def on_ready() -> None:
 
 @tasks.loop(seconds=30)
 async def reminder_loop() -> None:
+    """Periodically evaluate schedules and send due reminders."""
     current_time = now_local()
 
     if should_send("daily_scrum", DAILY_SCRUM_DAYS, get_dsm_reminder_time(DAILY_SCRUM_TIME), current_time):
@@ -583,17 +657,21 @@ async def reminder_loop() -> None:
 
 @reminder_loop.before_loop
 async def before_reminder_loop() -> None:
+    """Wait for bot readiness before starting periodic loop."""
     await bot.wait_until_ready()
+
 
 # These commands can be used to manually trigger reminders or manage 3P rounds.
 
 @bot.command(name="ping")
 async def ping(ctx: commands.Context) -> None:
+    """Simple health check command."""
     await ctx.send("Bot is running.")
 
 
 @bot.command(name="trigger_scrum")
 async def trigger_scrum(ctx: commands.Context) -> None:
+    """Manually send Daily Scrum reminder and open event window."""
     await ctx.channel.send(
         f"Halo teman-teman {KELOMPOK6_ROLE_MENTION}, jangan lupa malam ini ada DSM dengan {ASDOS_MENTION}"
     )
@@ -606,6 +684,7 @@ async def trigger_scrum(ctx: commands.Context) -> None:
 
 @bot.command(name="trigger_3p")
 async def trigger_3p(ctx: commands.Context) -> None:
+    """Manually start weekly 3P flow in current channel."""
     await ctx.channel.send(
         f"Halo teman-teman {KELOMPOK6_ROLE_MENTION}, jangan lupa kirim 3P kalian hari ini ya."
     )
@@ -632,12 +711,13 @@ async def trigger_3p(ctx: commands.Context) -> None:
     else:
         await ctx.send(
             "3P started, but no expected members are configured yet. "
-            "Set `THREE_P_ROLE_ID` or `THREE_P_MEMBER_IDS` in `.env`."
+            "Set `KELOMPOK6_ROLE_MENTION` or `THREE_P_MEMBER_IDS` in `.env`."
         )
 
 
 @bot.command(name="3p")
 async def submit_three_p(ctx: commands.Context, *, submission_text: str | None = None) -> None:
+    """Receive, validate, and store member 3P submission."""
     active_round = get_active_three_p_round()
     if not active_round:
         await ctx.send(
@@ -674,6 +754,7 @@ async def submit_three_p(ctx: commands.Context, *, submission_text: str | None =
     expected_members = active_round.get("expected_members", {})
     member_id = str(ctx.author.id)
 
+    # If expected list exists, only listed members may submit.
     if expected_members and member_id not in expected_members:
         await ctx.send("You are not listed in the current 3P member group.")
         return
@@ -700,6 +781,7 @@ async def submit_three_p(ctx: commands.Context, *, submission_text: str | None =
         expected_count = len(expected_members)
         await ctx.send(embed=build_three_p_status_embed(active_round))
 
+        # Auto-close once all expected members have submitted.
         if submitted_count >= expected_count:
             active_round["completed"] = True
             active_round["completed_at"] = now_local().isoformat()
@@ -716,6 +798,7 @@ async def submit_three_p(ctx: commands.Context, *, submission_text: str | None =
 
 @bot.command(name="status_3p")
 async def status_three_p(ctx: commands.Context) -> None:
+    """Show current 3P submission status."""
     active_round = get_active_three_p_round()
     if not active_round:
         await ctx.send("There is no active 3P right now.")
@@ -726,6 +809,7 @@ async def status_three_p(ctx: commands.Context) -> None:
 
 @bot.command(name="end_3p")
 async def end_three_p(ctx: commands.Context) -> None:
+    """Close active 3P round manually and show summary."""
     active_round = get_active_three_p_round()
     if not active_round:
         await ctx.send("There is no active 3P right now.")
@@ -747,7 +831,13 @@ async def end_three_p(ctx: commands.Context) -> None:
 
 @bot.command(name="schedule")
 async def schedule(ctx: commands.Context) -> None:
+    """Display currently configured reminder schedule."""
     await ctx.send(embed=build_schedule_summary_embed())
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
 
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing from the environment variables.")
