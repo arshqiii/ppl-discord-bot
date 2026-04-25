@@ -61,6 +61,11 @@ THREE_P_MEMBER_IDS = {
     if member_id.strip()
 }
 
+KELOMPOK6_ROLE_ID = None
+if KELOMPOK6_ROLE_MENTION:
+    role_digits = "".join(char for char in KELOMPOK6_ROLE_MENTION if char.isdigit())
+    KELOMPOK6_ROLE_ID = int(role_digits) if role_digits else None
+
 WEEKDAYS = [
     "Senin",
     "Selasa",
@@ -135,7 +140,7 @@ def get_today_name(current_time: datetime) -> str:
 
 def should_send(event_name: str, event_days: set[str], event_time: str, current_time: datetime) -> bool:
     """Check schedule and deduplicate reminder delivery per date."""
-    if get_today_name(current_time) not in event_days:
+    if get_today_name(current_time).lower() not in event_days:
         return False
 
     if current_time.strftime("%H:%M") != event_time:
@@ -258,17 +263,37 @@ def get_members_from_ids(guild: discord.Guild, member_ids: set[int]) -> dict[int
     return members
 
 
+def has_configured_three_p_role(member: discord.Member) -> bool:
+    """Return whether a member has the configured 3P role."""
+    if KELOMPOK6_ROLE_ID is None:
+        return True
+    return any(role.id == KELOMPOK6_ROLE_ID for role in member.roles)
+
+
+def has_three_p_access(member: discord.Member) -> bool:
+    """Return whether a member is allowed to use the 3P submission flow."""
+    if THREE_P_MEMBER_IDS and member.id not in THREE_P_MEMBER_IDS:
+        return False
+    return has_configured_three_p_role(member)
+
+
 def get_expected_three_p_members(guild: discord.Guild) -> dict[int, str]:
-    """Resolve expected 3P participants from role first, then fallback ids."""
-    if KELOMPOK6_ROLE_MENTION:
-        members_from_role = get_members_from_role(guild.get_role(KELOMPOK6_ROLE_MENTION))
-        if members_from_role:
-            return members_from_role
+    """Resolve expected 3P participants from configured role and/or member ids."""
+    members_by_id: dict[int, str] = {}
 
     if THREE_P_MEMBER_IDS:
-        return get_members_from_ids(guild, THREE_P_MEMBER_IDS)
+        members_by_id = get_members_from_ids(guild, THREE_P_MEMBER_IDS)
+    elif KELOMPOK6_ROLE_ID is not None:
+        members_by_id = get_members_from_role(guild.get_role(KELOMPOK6_ROLE_ID))
 
-    return {}
+    if KELOMPOK6_ROLE_ID is None:
+        return members_by_id
+
+    return {
+        member_id: member_name
+        for member_id, member_name in members_by_id.items()
+        if (member := guild.get_member(member_id)) and has_configured_three_p_role(member)
+    }
 
 
 def start_three_p_round(channel_id: int, current_time: datetime, expected_members: dict[int, str]) -> None:
@@ -754,9 +779,20 @@ async def submit_three_p(ctx: commands.Context, *, submission_text: str | None =
     expected_members = active_round.get("expected_members", {})
     member_id = str(ctx.author.id)
 
+    if isinstance(ctx.author, discord.Member) and not has_three_p_access(ctx.author):
+        await ctx.send("You are not allowed to submit 3P for this group.")
+        return
+
     # If expected list exists, only listed members may submit.
     if expected_members and member_id not in expected_members:
         await ctx.send("You are not listed in the current 3P member group.")
+        return
+
+    if member_id in active_round["submissions"]:
+        await ctx.send(
+            "You have already submitted your 3P for this session. "
+            f"Use `{COMMAND_PREFIX}status_3p` to check progress."
+        )
         return
 
     active_round["submissions"][member_id] = {
