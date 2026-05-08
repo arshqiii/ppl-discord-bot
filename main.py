@@ -52,6 +52,9 @@ THREE_P_DAYS = {
 }
 THREE_P_TIME = os.getenv("THREE_P_TIME", "16:00")
 
+THREE_P_FOLLOWUP_INTERVAL_HOURS = int(os.getenv("THREE_P_FOLLOWUP_INTERVAL_HOURS", "6"))
+THREE_P_DEADLINE_TIME = os.getenv("THREE_P_DEADLINE_TIME", "21:00")
+
 KELOMPOK6_ROLE_MENTION = os.getenv("KELOMPOK6_ROLE_MENTION")
 ASDOS_MENTION = os.getenv("ASDOS_MENTION")
 
@@ -306,6 +309,8 @@ def start_three_p_round(channel_id: int, current_time: datetime, expected_member
         "submissions": {},
         "completed": False,
         "completed_at": None,
+        "last_followup_sent_at": None,
+        "auto_closed": False,
     }
     save_state(state)
 
@@ -398,6 +403,14 @@ def build_three_p_status_embed(round_data: dict[str, Any]) -> discord.Embed:
         value="\n".join(f"• {name}" for name in pending_names) if pending_names else "-",
         inline=False,
     )
+    deadline = get_three_p_deadline_datetime(round_data)
+    if deadline:
+        embed.add_field(
+            name="📌 Deadline Auto-Close",
+            value=deadline.strftime("%A, %d %B %Y pukul %H:%M"),
+            inline=False,
+        )
+    
     return embed
 
 
@@ -535,6 +548,16 @@ def format_three_p_status(round_data: dict[str, Any]) -> str:
     ]
     return "\n".join(lines)
 
+def get_pending_three_p_members(round_data: dict[str, Any]) -> dict[str, str]:
+    """Return pending 3P members as {member_id: member_name}."""
+    expected_members = round_data.get("expected_members", {})
+    submissions = round_data.get("submissions", {})
+
+    return {
+        member_id: member_name
+        for member_id, member_name in expected_members.items()
+        if member_id not in submissions
+    }
 
 def format_three_p_forced_completion(round_data: dict[str, Any]) -> str:
     """Create plain-text summary when 3P is manually closed."""
@@ -606,6 +629,36 @@ async def collect_event_messages(channel: discord.TextChannel, event_name: str) 
 
     return collected
 
+def get_next_three_p_datetime(opened_at: datetime) -> datetime | None:
+    """Find the next scheduled 3P datetime after the current round was opened."""
+    for day_offset in range(1, 8):
+        candidate_date = opened_at.date() + timedelta(days=day_offset)
+        candidate_datetime = datetime.combine(
+            candidate_date,
+            datetime.strptime(THREE_P_TIME, "%H:%M").time(),
+            tzinfo=timezone,
+        )
+
+        candidate_day_name = get_today_name(candidate_datetime).lower()
+
+        if candidate_day_name in THREE_P_DAYS:
+            return candidate_datetime
+
+    return None
+
+def get_three_p_deadline_datetime(round_data: dict[str, Any]) -> datetime | None:
+    """Return auto-close deadline: one day before the next 3P day at configured night time."""
+    opened_at = datetime.fromisoformat(round_data["opened_at"])
+    next_three_p_datetime = get_next_three_p_datetime(opened_at)
+
+    if next_three_p_datetime is None:
+        return None
+
+    deadline_date = next_three_p_datetime.date() - timedelta(days=1)
+    deadline_time = datetime.strptime(THREE_P_DEADLINE_TIME, "%H:%M").time()
+
+    return datetime.combine(deadline_date, deadline_time, tzinfo=timezone)
+
 
 # ---------------------------------------------------------------------------
 # Reminder delivery and background loop
@@ -660,10 +713,111 @@ async def on_ready() -> None:
         reminder_loop.start()
 
 
+async def send_three_p_followup_if_needed(current_time: datetime) -> None:
+    """Send repeated reminder to members who have not submitted 3P yet."""
+    active_round = get_active_three_p_round()
+    if not active_round:
+        return
+
+    pending_members = get_pending_three_p_members(active_round)
+    if not pending_members:
+        return
+
+    channel = get_channel_by_id(active_round["channel_id"])
+    if channel is None:
+        logger.warning("3P follow-up channel %s could not be found.", active_round["channel_id"])
+        return
+
+    last_followup_raw = active_round.get("last_followup_sent_at")
+
+    if last_followup_raw:
+        last_followup = datetime.fromisoformat(last_followup_raw)
+        next_allowed_followup = last_followup + timedelta(hours=THREE_P_FOLLOWUP_INTERVAL_HOURS)
+
+        if current_time < next_allowed_followup:
+            return
+    else:
+        opened_at = datetime.fromisoformat(active_round["opened_at"])
+        first_allowed_followup = opened_at + timedelta(hours=THREE_P_FOLLOWUP_INTERVAL_HOURS)
+
+        if current_time < first_allowed_followup:
+            return
+
+    pending_mentions = " ".join(f"<@{member_id}>" for member_id in pending_members.keys())
+
+    embed = discord.Embed(
+        title="⏰ Reminder 3P Belum Submit",
+        description=(
+            "Beberapa anggota belum mengirim 3P.\n"
+            f"Mohon segera submit dengan format `{COMMAND_PREFIX}3p`."
+        ),
+        color=discord.Color.orange(),
+    )
+
+    embed.add_field(
+        name="⏳ Pending",
+        value="\n".join(f"• {name}" for name in pending_members.values()),
+        inline=False,
+    )
+
+    deadline = get_three_p_deadline_datetime(active_round)
+    if deadline:
+        embed.add_field(
+            name="📌 Deadline",
+            value=deadline.strftime("%A, %d %B %Y pukul %H:%M"),
+            inline=False,
+        )
+
+    await channel.send(
+        content=f"{pending_mentions} reminder untuk submit 3P ya.",
+        embed=embed,
+    )
+
+    active_round["last_followup_sent_at"] = current_time.isoformat()
+    save_state(state)
+
+async def auto_close_three_p_if_deadline_passed(current_time: datetime) -> None:
+    """Automatically close active 3P round when deadline has passed."""
+    active_round = get_active_three_p_round()
+    if not active_round:
+        return
+
+    deadline = get_three_p_deadline_datetime(active_round)
+    if deadline is None:
+        return
+
+    if current_time < deadline:
+        return
+
+    channel = get_channel_by_id(active_round["channel_id"])
+    if channel is None:
+        logger.warning("3P auto-close channel %s could not be found.", active_round["channel_id"])
+        return
+
+    active_round["completed"] = True
+    active_round["completed_at"] = current_time.isoformat()
+    active_round["auto_closed"] = True
+    save_state(state)
+
+    await channel.send(
+        embed=build_three_p_summary_embed(
+            active_round,
+            title="🛑 Weekly 3P Auto-Closed",
+            description=(
+                "Sesi 3P ditutup otomatis karena sudah melewati deadline. "
+                "Berikut status terakhir submission."
+            ),
+            color=discord.Color.orange(),
+        )
+    )
+
 @tasks.loop(seconds=30)
 async def reminder_loop() -> None:
     """Periodically evaluate schedules and send due reminders."""
     current_time = now_local()
+    
+    await auto_close_three_p_if_deadline_passed(current_time)
+    await send_three_p_followup_if_needed(current_time)
 
     if should_send("daily_scrum", DAILY_SCRUM_DAYS, get_dsm_reminder_time(DAILY_SCRUM_TIME), current_time):
         await send_event_reminder(
