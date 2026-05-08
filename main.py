@@ -749,7 +749,7 @@ async def send_three_p_followup_if_needed(current_time: datetime) -> None:
         title="⏰ Reminder 3P Belum Submit",
         description=(
             "Beberapa anggota belum mengirim 3P.\n"
-            f"Mohon segera submit dengan format `{COMMAND_PREFIX}3p`."
+            f"Bisa submit dengan format `{COMMAND_PREFIX}3p`."
         ),
         color=discord.Color.orange(),
     )
